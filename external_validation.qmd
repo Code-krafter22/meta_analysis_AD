@@ -86,7 +86,7 @@ This is the core *external validation* step: we do **not retrain** model coeffic
 To make this robust, we validate the expected `gene` and `weight` columns in the external weights file and stop if there are no overlapping genes.
 
 ```{python}
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score
 import matplotlib.pyplot as plt
 
 WEIGHTS_PATH = "data/GSE184942/meta-analysis-weights-per-gene.xlsx"
@@ -114,7 +114,11 @@ score = Xc.values @ w["weight"].values
 # ROC AUC on external cohort
 y_bin = (y == "AD").astype(int)
 sig_auc = roc_auc_score(y_bin, score)
+prevalence = y_bin.mean()
+sig_ap_point = average_precision_score(y_bin, score)
+print(f"No-skill AP baseline (prevalence): {prevalence:.3f}")
 print("Signature ROC AUC:", sig_auc)
+print(f"Signature AP (point estimate): {sig_ap_point:.3f}")
 
 # ROC plot
 fpr, tpr, _ = roc_curve(y_bin, score)
@@ -135,6 +139,8 @@ Point estimates alone can be unstable. This block computes 95% bootstrap confide
 
 ```{python}
 from sklearn.metrics import average_precision_score
+from sklearn.calibration import calibration_curve
+from scipy.special import expit
 
 def bootstrap_ci_auc(y_true, y_score, n_boot=5000, seed=1, ci=0.95):
     rng = np.random.default_rng(seed)
@@ -185,6 +191,21 @@ sig_ap, sig_ap_ci, _ = bootstrap_ci_ap(y_bin, score, n_boot=5000, seed=1)
 
 print(f"Signature ROC AUC = {sig_auc:.3f} (95% CI {sig_ci[0]:.3f}–{sig_ci[1]:.3f})")
 print(f"Signature AP = {sig_ap:.3f} (95% CI {sig_ap_ci[0]:.3f}–{sig_ap_ci[1]:.3f})")
+
+# Calibration check for a probability-like transformed signature score
+score_prob = expit((score - score.mean()) / score.std())
+fraction_pos, mean_pred = calibration_curve(y_bin, score_prob, n_bins=10)
+
+plt.figure(figsize=(5, 5))
+plt.plot(mean_pred, fraction_pos, marker="o", label="Signature")
+plt.plot([0, 1], [0, 1], linestyle="--", label="Perfect calibration")
+plt.xlabel("Mean predicted probability")
+plt.ylabel("Fraction positive")
+plt.title("Calibration Plot — Fixed Signature")
+plt.legend()
+plt.tight_layout()
+plt.savefig("Signature_Calibration_600dpi.png", dpi=600, bbox_inches="tight")
+plt.show()
 ```
 
 ## 4) Fit a baseline nested-CV elastic-net model on the external cohort (secondary analysis)
@@ -202,10 +223,14 @@ from sklearn.metrics import (
     precision_recall_curve,
     auc,
     confusion_matrix,
+    brier_score_loss,
 )
+import warnings
 
 X_np = X.values
 y_np = (y == "AD").astype(int)
+
+print(f"Class distribution — AD: {y_np.sum()}, Control: {(1-y_np).sum()}, Prevalence: {y_np.mean():.3f}")
 
 outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=1)
 inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=1)
@@ -258,6 +283,24 @@ print("Nested-CV PR AUC:", prAUC)
 print("Nested-CV Balanced Accuracy:", balAcc)
 print("Confusion matrix [[TN FP],[FN TP]]:\n", cm)
 print("Best params per fold:\n", best_params_each_fold)
+
+# Additional context for class imbalance and model stability
+brier = brier_score_loss(y_np, y_proba)
+print(f"Nested-CV Brier Score: {brier:.3f} (lower is better; no-skill baseline = {prevalence * (1 - prevalence):.3f})")
+
+ncv_auc, ncv_ci, _ = bootstrap_ci_auc(y_np, y_proba, n_boot=5000, seed=1)
+print(f"Nested-CV ROC AUC = {ncv_auc:.3f} (95% CI {ncv_ci[0]:.3f}–{ncv_ci[1]:.3f})")
+
+l1_ratios = [p["clf__l1_ratio"] for p in best_params_each_fold]
+C_vals = [p["clf__C"] for p in best_params_each_fold]
+if len(set(l1_ratios)) > 1 or len(set(C_vals)) > 1:
+    warnings.warn(
+        "Regularization parameters vary across outer folds "
+        f"(C={C_vals}, l1_ratio={l1_ratios}). "
+        "Elastic-net solution may be unstable; interpret nested-CV AUC cautiously.",
+        UserWarning,
+        stacklevel=2,
+    )
 ```
 
 ## 5) Plot nested-CV ROC and PR curves
@@ -265,7 +308,7 @@ print("Best params per fold:\n", best_params_each_fold)
 This block visualizes the nested-CV benchmark outputs.
 
 ```{python}
-from sklearn.metrics import roc_curve, average_precision_score
+from sklearn.metrics import roc_curve
 
 # Nested-CV ROC
 fpr_cv, tpr_cv, _ = roc_curve(y_np, y_proba)
@@ -280,7 +323,7 @@ plt.savefig("NestedCV_ROC_600dpi.png", dpi=600, bbox_inches="tight")
 plt.show()
 
 # Nested-CV PR
-ap = average_precision_score(y_np, y_proba)
+ap = prAUC  # already computed in Section 4
 plt.figure(figsize=(5, 5))
 plt.plot(rec, prec, linewidth=2)
 plt.xlabel("Recall")
@@ -338,6 +381,35 @@ if best_thr_spec is not None:
     print("CM:\n", confusion_matrix(y_np, pred))
 else:
     print("No threshold met the specificity target.")
+
+print(
+    "\nNOTE: Thresholds selected on out-of-fold predictions are still optimistically biased. "
+    "These operating points should be validated on a truly held-out dataset before clinical use."
+)
+```
+
+## 7) Summarize primary vs secondary analyses in a compact table
+
+This table helps reporting by clearly separating the fixed-signature external validation (primary) from nested-CV retraining (secondary).
+
+```{python}
+results = pd.DataFrame({
+    "Analysis": [
+        "Fixed Signature (External Validation)",
+        "Nested-CV Elastic-Net (Secondary Benchmark)",
+    ],
+    "ROC AUC": [f"{sig_auc:.3f}", f"{ncv_auc:.3f}"],
+    "95% CI": [f"{sig_ci[0]:.3f}–{sig_ci[1]:.3f}", f"{ncv_ci[0]:.3f}–{ncv_ci[1]:.3f}"],
+    "AP": [f"{sig_ap:.3f}", f"{prAUC:.3f}"],
+    "AP baseline (prevalence)": [f"{prevalence:.3f}", f"{prevalence:.3f}"],
+    "Note": [
+        "No retraining — primary result",
+        "Retrained on external data — secondary",
+    ],
+})
+
+print(results.to_string(index=False))
+results.to_csv("validation_summary_table.csv", index=False)
 ```
 
 ## Recommendations
