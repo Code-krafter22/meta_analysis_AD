@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
-"""External validation for AD/control classification using expression + metadata files.
+"""External validation for a fixed gene signature with class-imbalance-aware evaluation.
 
-Expected files
---------------
-1) Expression CSV (--input): rows are genes, columns are samples.
-   - One column must contain gene identifiers (default: first column, or --gene-col).
-2) Metadata CSV (--metadata): one row per sample with diagnosis labels.
-   - Must contain diagnosis column (default: diagnosis)
-   - Must contain sample identifier column (default: sample_id)
+Input assumptions:
+- CSV has one row per sample.
+- A label column contains case/control classes.
+- Expression columns are log2CPM values for genes.
+
+The script supports two validation modes:
+1) Fixed weighted score from a JSON file mapping gene -> coefficient.
+2) Class-weighted logistic regression fitted in repeated stratified CV.
+
+Outputs:
+- Console summary of mean +/- SD metrics across repeats.
+- Bootstrap 95% CIs for pooled out-of-fold predictions.
+- Optional CSV with per-sample out-of-fold predictions.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.calibration import calibration_curve
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -48,39 +56,43 @@ class FoldMetrics:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="External validation using expression matrix + metadata diagnosis labels"
+        description="External validation of AD gene signature under class imbalance"
     )
-    parser.add_argument("--input", required=True, help="Expression CSV (genes x samples)")
-    parser.add_argument("--metadata", required=True, help="Metadata CSV with diagnosis labels")
-    parser.add_argument(
-        "--sample-col",
-        default="sample_id",
-        help="Sample ID column in metadata (default: sample_id)",
-    )
-    parser.add_argument(
-        "--diagnosis-col",
-        default="diagnosis",
-        help="Diagnosis column in metadata (default: diagnosis)",
-    )
+    parser.add_argument("--input", required=True, help="CSV with labels + gene expression")
+    parser.add_argument("--label-col", required=True, help="Column containing AD/control labels")
     parser.add_argument(
         "--positive-label",
-        default="Ad",
-        help="Positive diagnosis label (default: Ad)",
+        default="AD",
+        help="Value in --label-col treated as positive class (default: AD)",
     )
     parser.add_argument(
-        "--gene-col",
+        "--genes",
+        nargs="+",
+        required=True,
+        help="List of genes in the fixed signature",
+    )
+    parser.add_argument(
+        "--score-weights",
         default=None,
-        help="Gene ID column in expression CSV (default: first column)",
+        help=(
+            "Optional JSON file with gene coefficients for a fixed score. "
+            "If omitted, script fits class-weighted logistic regression in repeated CV."
+        ),
     )
     parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
-        help="Decision threshold for predicted probability",
+        help="Decision threshold on predicted probability/score for class calls",
     )
     parser.add_argument("--n-splits", type=int, default=5, help="Stratified CV folds")
     parser.add_argument("--n-repeats", type=int, default=20, help="CV repeats")
-    parser.add_argument("--bootstrap", type=int, default=1000, help="Bootstrap iterations")
+    parser.add_argument(
+        "--bootstrap",
+        type=int,
+        default=1000,
+        help="Bootstrap iterations for 95%% CIs",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--predictions-out",
@@ -90,45 +102,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_expression(input_path: str, gene_col: str | None) -> pd.DataFrame:
-    expr = pd.read_csv(input_path)
-    if expr.empty:
-        raise ValueError("Expression file is empty")
+def validate_inputs(df: pd.DataFrame, label_col: str, genes: Sequence[str]) -> None:
+    if label_col not in df.columns:
+        raise ValueError(f"Label column '{label_col}' not found in input file")
 
-    gene_col_name = gene_col if gene_col is not None else expr.columns[0]
-    if gene_col_name not in expr.columns:
-        raise ValueError(f"Gene column '{gene_col_name}' not found in expression file")
-
-    expr = expr.set_index(gene_col_name)
-    if expr.index.duplicated().any():
-        raise ValueError("Duplicate gene IDs found in expression file")
-
-    # Convert all sample columns to numeric.
-    expr = expr.apply(pd.to_numeric, errors="coerce")
-    expr = expr.dropna(axis=0, how="any")
-    if expr.empty:
-        raise ValueError("No numeric gene rows remain after parsing expression matrix")
-
-    # Required orientation for sklearn: samples x genes.
-    x = expr.T
-    x.index = x.index.astype(str)
-    return x
-
-
-def load_metadata(metadata_path: str, sample_col: str, diagnosis_col: str) -> pd.DataFrame:
-    md = pd.read_csv(metadata_path)
-    missing = [c for c in [sample_col, diagnosis_col] if c not in md.columns]
+    missing = [g for g in genes if g not in df.columns]
     if missing:
-        raise ValueError("Missing metadata columns: " + ", ".join(missing))
-
-    md = md[[sample_col, diagnosis_col]].copy()
-    md[sample_col] = md[sample_col].astype(str)
-    if md[sample_col].duplicated().any():
-        raise ValueError(f"Duplicate sample IDs found in metadata column '{sample_col}'")
-    return md
+        raise ValueError(
+            "Missing genes in input file: " + ", ".join(missing) + ". "
+            "Ensure gene symbols match CSV column names exactly."
+        )
 
 
 def build_model(seed: int) -> Pipeline:
+    # class_weight='balanced' handles AD/control imbalance during model fitting.
     return Pipeline(
         [
             ("scaler", StandardScaler()),
@@ -146,11 +133,23 @@ def build_model(seed: int) -> Pipeline:
     )
 
 
-def metrics_from_predictions(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> FoldMetrics:
+def fixed_score(X: pd.DataFrame, weights: Dict[str, float]) -> np.ndarray:
+    # Linear weighted signature score; sigmoid transforms to pseudo-probability.
+    raw = np.zeros(X.shape[0], dtype=float)
+    for g, w in weights.items():
+        raw += X[g].to_numpy(dtype=float) * float(w)
+    return 1.0 / (1.0 + np.exp(-raw))
+
+
+def metrics_from_predictions(
+    y_true: np.ndarray, y_prob: np.ndarray, threshold: float
+) -> FoldMetrics:
     y_pred = (y_prob >= threshold).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
     sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
     specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+
     return FoldMetrics(
         auc=roc_auc_score(y_true, y_prob),
         auprc=average_precision_score(y_true, y_prob),
@@ -171,14 +170,25 @@ def bootstrap_ci(
 ) -> Dict[str, Tuple[float, float]]:
     rng = np.random.default_rng(seed)
     n = len(y_true)
-    stats = {k: [] for k in ["auc", "auprc", "balanced_accuracy", "sensitivity", "specificity", "mcc", "brier"]}
+    stats = {
+        "auc": [],
+        "auprc": [],
+        "balanced_accuracy": [],
+        "sensitivity": [],
+        "specificity": [],
+        "mcc": [],
+        "brier": [],
+    }
 
     for _ in range(n_bootstrap):
         idx = rng.integers(0, n, size=n)
         yt = y_true[idx]
         yp = y_prob[idx]
+
+        # Skip pathological resamples with only one class.
         if len(np.unique(yt)) < 2:
             continue
+
         m = metrics_from_predictions(yt, yp, threshold)
         stats["auc"].append(m.auc)
         stats["auprc"].append(m.auprc)
@@ -188,14 +198,14 @@ def bootstrap_ci(
         stats["mcc"].append(m.mcc)
         stats["brier"].append(m.brier)
 
-    out = {}
+    ci = {}
     for k, values in stats.items():
         if not values:
-            out[k] = (np.nan, np.nan)
+            ci[k] = (np.nan, np.nan)
         else:
             lo, hi = np.percentile(values, [2.5, 97.5])
-            out[k] = (float(lo), float(hi))
-    return out
+            ci[k] = (float(lo), float(hi))
+    return ci
 
 
 def summarize(name: str, values: List[float]) -> str:
@@ -207,26 +217,20 @@ def expected_calibration_error(y_true: np.ndarray, y_prob: np.ndarray, bins: int
     frac_pos, mean_pred = calibration_curve(y_true, y_prob, n_bins=bins, strategy="quantile")
     if len(frac_pos) == 0:
         return np.nan
+    # Equal weighting across bins produced by quantile strategy.
     return float(np.mean(np.abs(frac_pos - mean_pred)))
 
 
 def run_validation(args: argparse.Namespace) -> None:
-    x = load_expression(args.input, args.gene_col)
-    md = load_metadata(args.metadata, args.sample_col, args.diagnosis_col)
+    df = pd.read_csv(args.input)
+    validate_inputs(df, args.label_col, args.genes)
 
-    merged = md.merge(x, left_on=args.sample_col, right_index=True, how="inner")
-    if merged.empty:
-        raise ValueError("No overlapping sample IDs between metadata and expression matrix")
+    X = df.loc[:, args.genes].copy()
+    y = (df[args.label_col].astype(str) == str(args.positive_label)).astype(int).to_numpy()
 
-    y_raw = merged[args.diagnosis_col].astype(str).str.strip().str.lower()
-    positive = str(args.positive_label).strip().lower()
-    y = (y_raw == positive).astype(int).to_numpy()
     if y.sum() == 0 or y.sum() == len(y):
-        raise ValueError("Both classes are required after merging metadata/expression")
+        raise ValueError("Both classes are required for validation")
 
-    X = merged.drop(columns=[args.sample_col, args.diagnosis_col])
-
-    model = build_model(args.seed)
     cv = RepeatedStratifiedKFold(
         n_splits=args.n_splits, n_repeats=args.n_repeats, random_state=args.seed
     )
@@ -234,15 +238,35 @@ def run_validation(args: argparse.Namespace) -> None:
     per_fold: List[FoldMetrics] = []
     pooled_prob = np.full(len(y), np.nan, dtype=float)
 
+    use_fixed_score = args.score_weights is not None
+    weights = None
+    model = None
+    if use_fixed_score:
+        with open(args.score_weights, "r", encoding="utf-8") as f:
+            weights = json.load(f)
+        missing_weights = [g for g in args.genes if g not in weights]
+        if missing_weights:
+            raise ValueError(
+                "Missing coefficients in weight file for genes: "
+                + ", ".join(missing_weights)
+            )
+    else:
+        model = build_model(args.seed)
+
     for fold_idx, (train_idx, test_idx) in enumerate(cv.split(X, y), start=1):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
 
-        model.fit(X_train, y_train)
-        y_prob = model.predict_proba(X_test)[:, 1]
+        if use_fixed_score:
+            y_prob = fixed_score(X_test, weights)
+        else:
+            fold_model = clone(model)
+            fold_model.fit(X_train, y_train)
+            y_prob = fold_model.predict_proba(X_test)[:, 1]
 
         pooled_prob[test_idx] = y_prob
-        per_fold.append(metrics_from_predictions(y_test, y_prob, args.threshold))
+        m = metrics_from_predictions(y_test, y_prob, args.threshold)
+        per_fold.append(m)
 
         if fold_idx % args.n_splits == 0:
             print(f"Processed fold {fold_idx}/{args.n_splits * args.n_repeats}")
@@ -251,7 +275,13 @@ def run_validation(args: argparse.Namespace) -> None:
     y_true_oof = y[valid_mask]
     y_prob_oof = pooled_prob[valid_mask]
 
-    ci = bootstrap_ci(y_true_oof, y_prob_oof, args.threshold, args.bootstrap, args.seed)
+    ci = bootstrap_ci(
+        y_true=y_true_oof,
+        y_prob=y_prob_oof,
+        threshold=args.threshold,
+        n_bootstrap=args.bootstrap,
+        seed=args.seed,
+    )
 
     print("\n=== Repeated Stratified CV performance (mean ± SD) ===")
     print(summarize("AUROC", [m.auc for m in per_fold]))
@@ -262,17 +292,17 @@ def run_validation(args: argparse.Namespace) -> None:
     print(summarize("MCC", [m.mcc for m in per_fold]))
     print(summarize("Brier", [m.brier for m in per_fold]))
 
-    print("\n=== Bootstrapped 95% CI (pooled OOF predictions) ===")
+    print("\n=== Bootstrapped 95% CI (out-of-fold pooled predictions) ===")
     for k, (lo, hi) in ci.items():
         print(f"{k}: [{lo:.3f}, {hi:.3f}]")
 
-    precision, _, _ = precision_recall_curve(y_true_oof, y_prob_oof)
+    precision, recall, _ = precision_recall_curve(y_true_oof, y_prob_oof)
     ece = expected_calibration_error(y_true_oof, y_prob_oof, bins=10)
     print(f"\nPR curve points: {len(precision)}")
     print(f"Expected calibration error (10-bin): {ece:.3f}")
 
     if args.predictions_out:
-        out = merged[[args.sample_col, args.diagnosis_col]].copy()
+        out = df.copy()
         out["y_true"] = y
         out["y_prob_oof"] = pooled_prob
         out["y_pred_oof"] = (pooled_prob >= args.threshold).astype(int)
