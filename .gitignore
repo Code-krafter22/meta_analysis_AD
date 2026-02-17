@@ -1,0 +1,12 @@
+﻿# ignore large data
+data/
+results/
+~$*
+*.pptx
+*.xlsx
+*.csv
+*.tsv
+*.pdf
+.Rhistory
+*.png
+*.txt

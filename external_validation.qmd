@@ -1,0 +1,504 @@
+GSE184942 analysis
+```{python}
+import pandas as pd
+import numpy as np
+
+PATH = "data/GSE125583/DE_data/GSE125583_log2cpm_SELECTED_GENES.csv".csv"
+
+df = pd.read_csv(PATH)
+
+# Identify gene symbol column (in your file it's the LAST column, named 'Unnamed: 11')
+gene_col = df.columns[-1]
+
+# Sample columns are everything except the first (ensembl) and last (gene symbol)
+sample_cols = df.columns[1:-1].tolist()
+
+# Build gene x sample matrix using HGNC symbols
+expr = df[[gene_col] + sample_cols].copy()
+expr = expr.dropna(subset=[gene_col])
+expr[gene_col] = expr[gene_col].astype(str)
+
+# If duplicated symbols exist, keep the mean (you can change to sum if you prefer)
+expr = expr.groupby(gene_col, as_index=True)[sample_cols].mean()
+
+# Transpose -> samples x genes for ML
+X = expr.T  # rows=samples, cols=genes
+
+# Labels from sample names: AD vs HC
+y = X.index.to_series().apply(lambda s: "AD" if s.upper().startswith("AD") else "Control").values
+
+print("X shape (samples x genes):", X.shape)
+print("Class counts:", dict(zip(*np.unique(y, return_counts=True))))
+print("Genes (columns) example:", list(X.columns[:10]))
+```
+
+GSE125583
+
+```{python}
+import pandas as pd
+import numpy as np
+
+PATH_EXPR = "data/GSE125583/DE_data/GSE125583_log2cpm_SELECTED_GENES.csv"
+PATH_META = "data/GSE125583/DE_data/metadata_200samples.csv"
+
+df = pd.read_csv(PATH_EXPR)
+meta = pd.read_csv(PATH_META)
+
+# --- identify gene column ---
+# If your file has "Gene" as the first column, use it.
+# Otherwise fallback to first column.
+if "Gene" in df.columns:
+    gene_col = "Gene"
+else:
+    gene_col = df.columns[0]
+
+# --- sample columns: all columns except gene_col ---
+sample_cols = [c for c in df.columns if c != gene_col]
+
+# build gene x sample matrix
+expr = df[[gene_col] + sample_cols].copy()
+expr = expr.dropna(subset=[gene_col])
+expr[gene_col] = expr[gene_col].astype(str)
+
+# handle duplicates (mean is fine for log2cpm; for counts you'd typically sum)
+expr = expr.groupby(gene_col, as_index=True)[sample_cols].mean()
+
+# transpose -> samples x genes
+X = expr.T
+X.index.name = "geo_accession"
+
+# --- labels from metadata (diagnosis:ch1) ---
+meta["geo_accession"] = meta["geo_accession"].astype(str)
+meta["diagnosis:ch1"] = meta["diagnosis:ch1"].astype(str)
+
+def to_label(s):
+    s = s.lower()
+    if "control" in s:
+        return "Control"
+    if "alzheimer" in s or s == "ad":
+        return "AD"
+    return np.nan
+
+meta["Condition"] = meta["diagnosis:ch1"].apply(to_label)
+
+# align metadata to X (keeps only common samples)
+meta2 = meta.set_index("geo_accession").loc[X.index]
+y = meta2["Condition"].values
+
+# drop samples with NA labels (if any)
+keep = ~pd.isna(y)
+X = X.loc[keep]
+y = y[keep]
+
+print("X shape (samples x genes):", X.shape)
+print("Class counts:", dict(pd.Series(y).value_counts()))
+print("Genes (columns) example:", list(X.columns[:10]))
+```
+
+```{python}
+from sklearn.metrics import roc_auc_score, roc_curve
+import matplotlib.pyplot as plt
+
+# ---- Provide your weights file here ----
+WEIGHTS_PATH = "data/GSE184942/meta-analysis-weights-per-gene.xlsx"  # <-- change if needed
+
+w = pd.read_excel(WEIGHTS_PATH)  # columns: gene, weight
+w = w.dropna()
+w["gene"] = w["gene"].astype(str)
+
+# Keep only genes present in this dataset
+common = sorted(set(X.columns).intersection(set(w["gene"])))
+print("Common genes with weights:", len(common))
+
+w = w.set_index("gene").loc[common]
+Xc = X[common]
+
+# Signature score per sample
+score = Xc.values @ w["weight"].values
+
+# AUC
+auc = roc_auc_score((y == "AD").astype(int), score)
+print("Signature ROC AUC:", auc)
+
+# Plot ROC
+fpr, tpr, _ = roc_curve((y == "AD").astype(int), score)
+plt.figure()
+plt.plot(fpr, tpr)
+plt.plot([0,1],[0,1], linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title(f"Signature ROC (AUC={auc:.3f})")
+plt.show()
+```
+
+```{python}
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, balanced_accuracy_score, precision_recall_curve, auc, confusion_matrix
+
+X_np = X.values
+y_np = (y == "AD").astype(int)
+
+outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=1)
+inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=1)
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", LogisticRegression(
+        solver="saga",
+        penalty="elasticnet",
+        max_iter=20000,
+        class_weight="balanced",   # helps if imbalance
+        random_state=1
+    ))
+])
+
+param_grid = {
+    "clf__C": [0.01, 0.1, 1, 10, 100],
+    "clf__l1_ratio": [0.0, 0.25, 0.5, 0.75, 1.0],  # 0=ridge, 1=lasso
+}
+
+y_proba = np.zeros(len(y_np))
+y_pred  = np.zeros(len(y_np), dtype=int)
+
+best_params_each_fold = []
+
+for train_idx, test_idx in outer.split(X_np, y_np):
+    Xtr, Xte = X_np[train_idx], X_np[test_idx]
+    ytr, yte = y_np[train_idx], y_np[test_idx]
+
+    gs = GridSearchCV(
+        pipe, param_grid=param_grid,
+        scoring="roc_auc",
+        cv=inner,
+        n_jobs=-1
+    )
+    gs.fit(Xtr, ytr)
+    best_params_each_fold.append(gs.best_params_)
+
+    proba = gs.predict_proba(Xte)[:, 1]
+    pred  = (proba >= 0.5).astype(int)
+
+    y_proba[test_idx] = proba
+    y_pred[test_idx]  = pred
+
+# Metrics
+rocAUC = roc_auc_score(y_np, y_proba)
+balAcc = balanced_accuracy_score(y_np, y_pred)
+
+prec, rec, _ = precision_recall_curve(y_np, y_proba)
+prAUC = auc(rec, prec)
+
+cm = confusion_matrix(y_np, y_pred)
+
+print("Nested-CV ROC AUC:", rocAUC)
+print("Nested-CV PR AUC:", prAUC)
+print("Nested-CV Balanced Accuracy:", balAcc)
+print("Confusion matrix [[TN FP],[FN TP]]:\n", cm)
+print("Best params per fold:\n", best_params_each_fold)
+```
+
+```{python}
+from sklearn.metrics import roc_curve
+
+import matplotlib.pyplot as plt
+
+# ROC
+fpr, tpr, _ = roc_curve(y_np, y_proba)
+plt.figure()
+plt.plot(fpr, tpr)
+plt.plot([0,1],[0,1], linestyle="--")
+plt.xlabel("FPR")
+plt.ylabel("TPR")
+plt.title(f"Nested-CV ROC (AUC={rocAUC:.3f})")
+plt.show()
+
+# PR
+plt.figure()
+plt.plot(rec, prec)
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title(f"Nested-CV PR (AUC={prAUC:.3f})")
+plt.show()
+```
+
+```{python}
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, roc_auc_score
+
+y_bin = (y == "AD").astype(int)
+
+sig_auc = roc_auc_score(y_bin, score)
+fpr, tpr, _ = roc_curve(y_bin, score)
+
+plt.figure(figsize=(5,5))
+plt.plot(fpr, tpr, linewidth=2)
+plt.plot([0,1],[0,1], linestyle="--", linewidth=1)
+plt.xlabel("False Positive Rate", fontsize=12)
+plt.ylabel("True Positive Rate", fontsize=12)
+plt.title(f"36-Gene Signature ROC (AUC={sig_auc:.3f})", fontsize=13)
+plt.xticks(fontsize=11)
+plt.yticks(fontsize=11)
+plt.tight_layout()
+
+plt.savefig("Signature_ROC_600dpi.png", dpi=600, bbox_inches="tight")
+plt.close()
+```
+
+```{python}
+from sklearn.metrics import roc_curve, roc_auc_score
+
+rocAUC = roc_auc_score(y_np, y_proba)
+fpr, tpr, _ = roc_curve(y_np, y_proba)
+
+plt.figure(figsize=(5,5))
+plt.plot(fpr, tpr, linewidth=2)
+plt.plot([0,1],[0,1], linestyle="--", linewidth=1)
+plt.xlabel("False Positive Rate", fontsize=12)
+plt.ylabel("True Positive Rate", fontsize=12)
+plt.title(f"Nested-CV ROC (AUC={rocAUC:.3f})", fontsize=13)
+plt.xticks(fontsize=11)
+plt.yticks(fontsize=11)
+plt.tight_layout()
+
+plt.savefig("NestedCV_ROC_600dpi.png", dpi=600, bbox_inches="tight")
+plt.close()
+```
+
+```{python}
+from sklearn.metrics import precision_recall_curve, average_precision_score
+
+ap = average_precision_score(y_np, y_proba)
+prec, rec, _ = precision_recall_curve(y_np, y_proba)
+
+plt.figure(figsize=(5,5))
+plt.plot(rec, prec, linewidth=2)
+plt.xlabel("Recall", fontsize=12)
+plt.ylabel("Precision", fontsize=12)
+plt.title(f"Nested-CV PR Curve (AP={ap:.3f})", fontsize=13)
+plt.xticks(fontsize=11)
+plt.yticks(fontsize=11)
+plt.tight_layout()
+
+plt.savefig("NestedCV_PR_600dpi.png", dpi=600, bbox_inches="tight")
+plt.close()
+```
+
+```{python}
+import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+def bootstrap_ci_auc(y_true, y_score, n_boot=5000, seed=1, ci=0.95):
+    """
+    Returns: (auc_point, (ci_low, ci_high), boot_aucs_array)
+    Bootstraps samples with replacement and computes ROC AUC.
+    Skips resamples that contain only one class.
+    """
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+
+    auc_point = roc_auc_score(y_true, y_score)
+
+    boot = []
+    n = len(y_true)
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)  # sample with replacement
+        yt = y_true[idx]
+        ys = y_score[idx]
+        if len(np.unique(yt)) < 2:
+            continue
+        boot.append(roc_auc_score(yt, ys))
+
+    boot = np.array(boot)
+    alpha = (1 - ci) / 2
+    lo = np.quantile(boot, alpha)
+    hi = np.quantile(boot, 1 - alpha)
+    return auc_point, (lo, hi), boot
+
+def bootstrap_ci_ap(y_true, y_score, n_boot=5000, seed=1, ci=0.95):
+    """
+    Average Precision (PR-AUC-like) bootstrap CI.
+    """
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+
+    ap_point = average_precision_score(y_true, y_score)
+
+    boot = []
+    n = len(y_true)
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        yt = y_true[idx]
+        ys = y_score[idx]
+        if len(np.unique(yt)) < 2:
+            continue
+        boot.append(average_precision_score(yt, ys))
+
+    boot = np.array(boot)
+    alpha = (1 - ci) / 2
+    lo = np.quantile(boot, alpha)
+    hi = np.quantile(boot, 1 - alpha)
+    return ap_point, (lo, hi), boot
+```
+
+```{python}
+y_bin = (y == "AD").astype(int)
+
+sig_auc, sig_ci, _ = bootstrap_ci_auc(y_bin, score, n_boot=5000, seed=1)
+print(f"Signature ROC AUC = {sig_auc:.3f} (95% CI {sig_ci[0]:.3f}–{sig_ci[1]:.3f})")
+
+# optional: AP CI
+sig_ap, sig_ap_ci, _ = bootstrap_ci_ap(y_bin, score, n_boot=5000, seed=1)
+print(f"Signature AP = {sig_ap:.3f} (95% CI {sig_ap_ci[0]:.3f}–{sig_ap_ci[1]:.3f})")
+```
+
+```{python}
+cv_auc, cv_ci, _ = bootstrap_ci_auc(y_np, y_proba, n_boot=5000, seed=1)
+print(f"Nested-CV ROC AUC = {cv_auc:.3f} (95% CI {cv_ci[0]:.3f}–{cv_ci[1]:.3f})")
+
+cv_ap, cv_ap_ci, _ = bootstrap_ci_ap(y_np, y_proba, n_boot=5000, seed=1)
+print(f"Nested-CV AP = {cv_ap:.3f} (95% CI {cv_ap_ci[0]:.3f}–{cv_ap_ci[1]:.3f})")
+```
+
+
+```{python}
+import numpy as np
+from sklearn.metrics import balanced_accuracy_score, confusion_matrix
+
+thr_grid = np.linspace(0, 1, 1001)
+best_thr, best_ba = None, -1
+
+for thr in thr_grid:
+    pred = (y_proba >= thr).astype(int)
+    ba = balanced_accuracy_score(y_np, pred)
+    if ba > best_ba:
+        best_ba, best_thr = ba, thr
+
+print("Best threshold (max balanced acc):", best_thr)
+print("Best balanced acc:", best_ba)
+print("Confusion matrix at best thr:\n", confusion_matrix(y_np, (y_proba >= best_thr).astype(int)))
+```
+
+
+```{python}
+from sklearn.metrics import confusion_matrix
+
+def spec_sens(y_true, y_pred):
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    spec = tn / (tn + fp) if (tn+fp)>0 else np.nan
+    sens = tp / (tp + fn) if (tp+fn)>0 else np.nan
+    return spec, sens
+
+target_spec = 0.80
+best_thr, best_sens = None, -1
+
+for thr in np.linspace(0, 1, 1001):
+    pred = (y_proba >= thr).astype(int)
+    spec, sens = spec_sens(y_np, pred)
+    if spec >= target_spec and sens > best_sens:
+        best_sens, best_thr = sens, thr
+
+print("Threshold achieving specificity>=0.80 with max sensitivity:", best_thr)
+if best_thr is not None:
+    pred = (y_proba >= best_thr).astype(int)
+    print("Spec, Sens:", spec_sens(y_np, pred))
+    print("CM:\n", confusion_matrix(y_np, pred))
+else:
+    print("No threshold achieved that specificity target.")
+```
+
+```{python}
+from sklearn.calibration import CalibratedClassifierCV
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", LogisticRegression(
+        solver="saga", penalty="elasticnet", max_iter=20000,
+        class_weight="balanced", random_state=1))
+])
+
+# inside each outer fold:
+cal = CalibratedClassifierCV(estimator=pipe, method="isotonic", cv=inner)
+cal.fit(Xtr, ytr)
+proba = cal.predict_proba(Xte)[:, 1]
+```
+
+```{python}
+# example: give Control 2x weight, AD 1x
+class_w = {0: 2.0, 1: 1.0}  # 0=Control, 1=AD
+LogisticRegression(..., class_weight=class_w)
+```
+
+```{python}
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, balanced_accuracy_score, precision_recall_curve, auc, confusion_matrix
+
+X_np = X.values
+y_np = (y == "AD").astype(int)
+
+outer = StratifiedKFold(n_splits=5, shuffle=True, random_state=1)
+inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=1)
+
+pipe = Pipeline([
+    ("scaler", StandardScaler()),
+    ("clf", LogisticRegression(
+        solver="saga",
+        penalty="elasticnet",
+        max_iter=20000,
+        class_weight=class_w,   # helps if imbalance
+        random_state=1
+    ))
+])
+
+param_grid = {
+    "clf__C": [0.01, 0.1, 1, 10, 100],
+    "clf__l1_ratio": [0.0, 0.25, 0.5, 0.75, 1.0],  # 0=ridge, 1=lasso
+    "clf__class_weight": [None, "balanced", {0:2,1:1}, {0:3,1:1}]
+}
+
+y_proba = np.zeros(len(y_np))
+y_pred  = np.zeros(len(y_np), dtype=int)
+
+best_params_each_fold = []
+
+for train_idx, test_idx in outer.split(X_np, y_np):
+    Xtr, Xte = X_np[train_idx], X_np[test_idx]
+    ytr, yte = y_np[train_idx], y_np[test_idx]
+
+    gs = GridSearchCV(
+        pipe, param_grid=param_grid,
+        scoring="roc_auc",
+        cv=inner,
+        n_jobs=-1
+    )
+    gs.fit(Xtr, ytr)
+    best_params_each_fold.append(gs.best_params_)
+
+    proba = gs.predict_proba(Xte)[:, 1]
+    pred  = (proba >= 0.5).astype(int)
+
+    y_proba[test_idx] = proba
+    y_pred[test_idx]  = pred
+
+# Metrics
+rocAUC = roc_auc_score(y_np, y_proba)
+balAcc = balanced_accuracy_score(y_np, y_pred)
+
+prec, rec, _ = precision_recall_curve(y_np, y_proba)
+prAUC = auc(rec, prec)
+
+cm = confusion_matrix(y_np, y_pred)
+
+print("Nested-CV ROC AUC:", rocAUC)
+print("Nested-CV PR AUC:", prAUC)
+print("Nested-CV Balanced Accuracy:", balAcc)
+print("Confusion matrix [[TN FP],[FN TP]]:\n", cm)
+print("Best params per fold:\n", best_params_each_fold)
+```
