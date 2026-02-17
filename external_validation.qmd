@@ -1,6 +1,6 @@
 # External Validation Analysis (GSE125583)
 
-This document evaluates whether a gene signature derived from the discovery/meta-analysis cohort (GSE184942) generalizes to an independent external cohort (GSE125583).
+This document evaluates whether a gene signature derived from the discovery/meta-analysis cohort generalizes to an independent external cohort (GSE125583).
 
 ## 1) Load expression data and metadata, then build a sample-by-gene matrix
 
